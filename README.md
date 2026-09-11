@@ -1,7 +1,7 @@
 # wco-dl
 VIBE-CODED Downloader for wco.tv, educational use only. Use at your own risk
 
-For the public domain
+This project is dedicated to the public domain. No rights reserved. Do as you will
 
 Usage:
 
