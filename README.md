@@ -6,4 +6,5 @@ This project is dedicated to the public domain. No rights reserved. Do as you wi
 Usage:
 
 -de "URL"  --> downloads a episode from a episode url
+
 -ds "URL"  --> downloads all episodes from a series url
