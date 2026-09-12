@@ -2,7 +2,9 @@
 wco-dl — download anime & cartoons from wco.tv
 """
 
+import io
 import json
+import logging
 import pathlib
 import re
 import shutil
@@ -18,12 +20,50 @@ import cloudscraper
 import pydantic
 import requests
 import typer
-from logzero import logger
 from playwright.sync_api import sync_playwright
 from tqdm import tqdm
 
 # Suppress harmless Playwright asyncio cleanup warnings on Windows
 warnings.filterwarnings("ignore", category=ResourceWarning)
+
+# ---------------------------------------------------------------------------
+# Terminal colours
+# ---------------------------------------------------------------------------
+
+class C:
+    """ANSI colour codes — gracefully disabled on terminals that don't support them."""
+    import sys as _sys
+    _on = _sys.stdout.isatty() if hasattr(_sys.stdout, 'isatty') else False
+
+    GREEN  = "\033[92m"  if _on else ""
+    YELLOW = "\033[93m"  if _on else ""
+    RED    = "\033[91m"  if _on else ""
+    CYAN   = "\033[96m"  if _on else ""
+    DIM    = "\033[2m"   if _on else ""
+    BOLD   = "\033[1m"   if _on else ""
+    RESET  = "\033[0m"   if _on else ""
+
+class EpisodeLogger:
+    """
+    Buffers debug lines for the current episode in memory.
+    On success the buffer is discarded. On failure it's included in errors.txt.
+    """
+    def __init__(self):
+        self._buf: list[str] = []
+
+    def debug(self, msg: str):
+        self._buf.append(msg)
+
+    def flush(self) -> str:
+        """Return all buffered lines as a single string and clear the buffer."""
+        out = "\n".join(self._buf)
+        self._buf.clear()
+        return out
+
+    def clear(self):
+        self._buf.clear()
+
+logger = EpisodeLogger()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -172,17 +212,17 @@ class LibraryDB:
         ).fetchone()[0]
         self.conn.execute(
             "INSERT OR REPLACE INTO episodes (season_id, episode_name, filename, language) VALUES (?, ?, ?, ?)",
-            (season_id, episode, filename, language),
+            (season_id, f"{episode} [{language}]", filename, language),
         )
         self.conn.commit()
 
-    def get_episode_filename(self, series: str, season: str, episode: str) -> str | None:
+    def get_episode_filename(self, series: str, season: str, episode: str, language: str) -> str | None:
         row = self.conn.execute(
             """SELECT e.filename FROM episodes e
                JOIN seasons s   ON e.season_id  = s.id
                JOIN series ser  ON s.series_id  = ser.id
                WHERE ser.name = ? AND s.name = ? AND e.episode_name = ?""",
-            (series, season, episode),
+            (series, season, f"{episode} [{language}]"),
         ).fetchone()
         return row[0] if row else None
 
@@ -431,9 +471,9 @@ def parse_episode_meta(url: str) -> tuple[str, str, str]:
     # Strip trailing language suffix (case-insensitive)
     text  = re.sub(r"\s+english\s+(subbed|dubbed)\s*$", "", text, flags=re.IGNORECASE).strip()
 
-    # Extract episode number
-    ep_m  = re.search(r"\bepisode\s*(\d+)\b", text, re.IGNORECASE)
-    ep_no = ep_m.group(1) if ep_m else "0"
+    # Extract episode number (handles "Episode 1", "Episode 1A", "Episode 1B" etc.)
+    ep_m  = re.search(r"\bepisode\s*(\d+[A-Za-z]?)\b", text, re.IGNORECASE)
+    ep_no = ep_m.group(1).upper() if ep_m else "0"
 
     # Extract season number
     sea_m = re.search(r"\bseason\s*(\d+)\b", text, re.IGNORECASE)
@@ -559,7 +599,7 @@ class Scraper:
         query       = parse_qs(parsed.query, keep_blank_values=True)
         file_param  = query.get("file",  [""])[0]
         embed_param = query.get("embed", [""])[0]
-        hd_param    = query.get("hd",    ["1"])[0]
+        hd_param    = query.get("hd",    [""])[0]   # only send if present in URL
         pid_param   = query.get("pid",   [""])[0]
         h_param     = query.get("h",     [""])[0]
         t_param     = query.get("t",     [""])[0]
@@ -570,20 +610,23 @@ class Scraper:
         # .flv → .mp4
         base = file_param.rsplit(".", 1)[0] + ".mp4"
 
-        # Build v= param — exactly as the browser does:
-        #   cizgi  → v=cizgi/<filename only, no subdirs>
-        #   others → v=<raw file path, no embed prefix, spaces as %20>
-        if embed_param == "cizgi":
-            filename = base.rsplit("/", 1)[-1] if "/" in base else base
-            video_path = f"cizgi/{filename}"
-        else:
+        # Build v= param — confirmed by HAR for each embed type:
+        #   ndisk  → v=<raw file path, NO prefix>
+        #   anime  → v=<raw file path, NO prefix>
+        #   cizgi  → v=cizgi/<full file path>
+        #   neptun → v=neptun/<full file path>
+        #   others → v=<embed>/<full file path>
+        if embed_param in ("ndisk", "anime"):
             video_path = base
+        else:
+            video_path = f"{embed_param}/{base}"
         v_encoded = quote(video_path, safe="/")
 
-        qs = f"v={v_encoded}&embed={embed_param}&hd={hd_param}"
-        if pid_param: qs += f"&pid={pid_param}"
-        if h_param:   qs += f"&h={h_param}"
-        if t_param:   qs += f"&t={t_param}"
+        qs = f"v={v_encoded}&embed={embed_param}"
+        if hd_param:    qs += f"&hd={hd_param}"
+        if pid_param:   qs += f"&pid={pid_param}"
+        if h_param:     qs += f"&h={h_param}"
+        if t_param:     qs += f"&t={t_param}"
 
         getvidlink = urljoin(f"{parsed.scheme}://{parsed.netloc}", "/inc/embed/getvidlink.php")
 
@@ -607,6 +650,7 @@ class Scraper:
         except Exception as e:
             logger.debug(f"  Embed page preload failed (non-fatal): {e}")
 
+        phpsessid = self.net.session.cookies.get("PHPSESSID")
         xhr_headers = {
             "User-Agent": USER_AGENT,
             "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -617,6 +661,9 @@ class Scraper:
             "Sec-Fetch-Site": "same-origin",
             "Referer": video_js_url,
         }
+        if phpsessid:
+            xhr_headers["Cookie"] = f"PHPSESSID={phpsessid}"
+            logger.debug(f"  Sending PHPSESSID to getvidlink: {phpsessid[:8]}...")
 
         logger.debug(f"  getvidlink: {getvidlink}?{qs[:120]}")
         resp = self.net.raw_get(f"{getvidlink}?{qs}", headers=xhr_headers)
@@ -640,9 +687,19 @@ class Scraper:
 
         self.net.prime_server(server)
 
+        # Token resolution uses bare embed origin as Referer (confirmed by HAR)
+        phpsessid = self.net.session.cookies.get("PHPSESSID")
+        token_headers = {
+            "User-Agent": USER_AGENT,
+            "Referer": "https://embed.wcostream.com/",
+            "Origin": "https://embed.wcostream.com",
+        }
+        if phpsessid:
+            token_headers["Cookie"] = f"PHPSESSID={phpsessid}"
+
         sources = []
         for token, label in [(enc, "480p"), (hd_token, "720p"), (fhd_token, "1080p")]:
-            url = self._resolve_token(token, server, xhr_headers)
+            url = self._resolve_token(token, server, token_headers)
             if url:
                 sources.append({"label": label, "url": url})
 
@@ -794,6 +851,47 @@ class Scraper:
 
 
 # ---------------------------------------------------------------------------
+# Error log
+# ---------------------------------------------------------------------------
+
+class ErrorLog:
+    """Collects error details during a run and writes them to errors.txt."""
+
+    def __init__(self):
+        self._entries: list[str] = []
+
+    def add(self, episode_label: str, url: str, detail: str, debug_log: str = ""):
+        entry = (
+            f"Episode : {episode_label}\n"
+            f"URL     : {url}\n"
+            f"Error   : {detail}\n"
+        )
+        if debug_log:
+            entry += f"\nDebug log:\n{debug_log}\n"
+        self._entries.append(entry)
+
+    def has_errors(self) -> bool:
+        return bool(self._entries)
+
+    def write(self, path: str = "errors.txt"):
+        p = pathlib.Path(path)
+        with p.open("w", encoding="utf-8") as f:
+            f.write(f"wco-dl error log\n{'─' * 60}\n\n")
+            for i, entry in enumerate(self._entries, 1):
+                f.write(f"[{i}]\n{entry}\n")
+
+    def print_summary(self):
+        """Print a red warning to the terminal if any errors occurred."""
+        if self._entries:
+            RED   = "\033[91m"
+            RESET = "\033[0m"
+            print(
+                f"\n{RED}Errors occurred during download of some episodes. "
+                f"Check the specifics in errors.txt{RESET}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Download orchestration
 # ---------------------------------------------------------------------------
 
@@ -804,14 +902,21 @@ def download_episode(
     config: Config,
     db: LibraryDB,
     progress: Progress,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
+    """
+    Returns (success, short_message, error_detail).
+    short_message is always shown in the terminal.
+    error_detail is non-empty only on failure and goes to errors.txt.
+    """
     # Step 1: get embed URL (catches premium episodes)
     try:
         embed_url = scraper.get_embed_url(url)
     except RuntimeError as e:
+        debug_log = logger.flush()
         if "Premium episode" in str(e):
-            return False, f"⏭  Skipped  — premium only"
-        return False, f"✗  Failed   — could not load page\n     {e}"
+            return False, "⏭  Skipped  — premium only", ""
+        detail = f"Could not load page: {e}\n{traceback.format_exc()}"
+        return False, "✗  Failed   — could not load page", detail
 
     # Step 2: parse episode metadata
     show, season, episode = parse_episode_meta(url)
@@ -819,19 +924,18 @@ def download_episode(
     logger.debug(f"── {show} / {season} / {episode} ({language}) ──")
 
     # Step 3: already downloaded?
-    if existing := db.get_episode_filename(show, season, episode):
+    if existing := db.get_episode_filename(show, season, episode, language):
         progress.remove_pending(url)
-        return True, f"⏭  Skipped  — already downloaded ({existing})"
+        logger.clear()
+        return True, f"⏭  {C.DIM}Skipped{C.RESET}  — already downloaded ({existing})", ""
 
     # Step 4: extract video sources
     try:
         sources = scraper.get_sources(embed_url)
     except Exception as e:
-        return False, (
-            f"✗  Failed   — source extraction error\n"
-            f"     {e}\n"
-            f"     {traceback.format_exc().splitlines()[-2]}"
-        )
+        debug_log = logger.flush()
+        detail = f"Source extraction failed: {e}\n{traceback.format_exc()}"
+        return False, "✗  Failed   — source extraction error", detail
 
     source   = scraper.select_resolution(sources, config.settings.resolution)
     media    = source["url"]
@@ -853,17 +957,16 @@ def download_episode(
 
         db.add_episode(show, season, episode, hex_name, language)
         progress.remove_pending(url)
-        return True, f"✓  Done     — {season} {episode} [{language}] → {hex_name}"
+        logger.clear()
+        return True, f"✓  {C.GREEN}Done{C.RESET}     — {season} {episode} [{language}] → {C.DIM}{hex_name}{C.RESET}", ""
 
     except Exception as e:
+        debug_log = logger.flush()
         for p in (temp, final):
             if p.exists():
                 p.unlink()
-        return False, (
-            f"✗  Failed   — download error\n"
-            f"     {e}\n"
-            f"     URL: {media[:80]}"
-        )
+        detail = f"Download error: {e}\nMedia URL: {media}\n{traceback.format_exc()}"
+        return False, "✗  Failed   — download error", detail
 
 
 def download_series(
@@ -873,6 +976,7 @@ def download_series(
     config: Config,
     db: LibraryDB,
     progress: Progress,
+    error_log: ErrorLog,
 ) -> None:
     print(f"  Fetching episode list...")
     episodes = scraper.get_episodes(url)
@@ -883,14 +987,17 @@ def download_series(
     ok = skip = fail = 0
     for i, (ep_url, label) in enumerate(episodes, 1):
         print(f"  [{i:>3}/{len(episodes)}] {label}")
-        success, msg = download_episode(ep_url, network, scraper, config, db, progress)
+        success, msg, detail = download_episode(ep_url, network, scraper, config, db, progress)
         print(f"         {msg}")
         if success:
             if "Skipped" in msg: skip += 1
             else: ok += 1
         else:
-            if "premium" in msg: skip += 1
-            else: fail += 1
+            if "premium" in msg or "Skipped" in msg:
+                skip += 1
+            else:
+                fail += 1
+                error_log.add(label, ep_url, detail, logger.flush())
     print(f"\n  Done — {ok} downloaded, {skip} skipped, {fail} failed.")
 
 
@@ -939,62 +1046,74 @@ def main(
 
     config, network, scraper, db, progress = _init()
     db.cleanup_orphaned()
+    error_log = ErrorLog()
 
     if stale := progress.get_pending():
         print(f"Clearing {len(stale)} stale pending entry(s) from previous session.")
         progress.clear_pending()
 
-    # ── Search ──────────────────────────────────────────────────────────────
-    if search:
-        if not target:
-            typer.echo("--search requires a query"); raise typer.Exit(1)
-        print(f"Searching for '{target}'...")
-        results = scraper.search(target)
-        if not results:
-            print("No results found.")
-        else:
-            print(f"Found {len(results)} result(s):\n")
-            for path in results:
-                name = path.replace("/anime/", "").replace("-", " ").title()
-                print(f"  {name}")
-                print(f"  https://www.wco.tv{path}\n")
+    try:
+        # ── Search ──────────────────────────────────────────────────────────
+        if search:
+            if not target:
+                typer.echo("--search requires a query"); raise typer.Exit(1)
+            print(f"Searching for '{target}'...")
+            results = scraper.search(target)
+            if not results:
+                print("No results found.")
+            else:
+                print(f"Found {len(results)} result(s):\n")
+                for path in results:
+                    name = path.replace("/anime/", "").replace("-", " ").title()
+                    print(f"  {name}")
+                    print(f"  https://www.wco.tv{path}\n")
 
-    # ── Single episode ───────────────────────────────────────────────────────
-    elif episode:
-        if not target:
-            typer.echo("--episode requires a URL"); raise typer.Exit(1)
-        show, season, ep = parse_episode_meta(target)
-        print(f"Downloading: {show} — {season} {ep}")
-        _, msg = download_episode(target, network, scraper, config, db, progress)
-        print(f"  {msg}")
+        # ── Single episode ───────────────────────────────────────────────────
+        elif episode:
+            if not target:
+                typer.echo("--episode requires a URL"); raise typer.Exit(1)
+            show, season, ep = parse_episode_meta(target)
+            print(f"Downloading: {show} — {season} {ep}")
+            success, msg, detail = download_episode(target, network, scraper, config, db, progress)
+            print(f"  {msg}")
+            if not success and detail:
+                error_log.add(f"{show} — {season} {ep}", target, detail, logger.flush())
 
-    # ── Full series ──────────────────────────────────────────────────────────
-    elif series:
-        if not target:
-            typer.echo("--series requires a URL"); raise typer.Exit(1)
-        print(f"Series: {target}")
-        download_series(target, network, scraper, config, db, progress)
+        # ── Full series ──────────────────────────────────────────────────────
+        elif series:
+            if not target:
+                typer.echo("--series requires a URL"); raise typer.Exit(1)
+            print(f"Series: {target}")
+            download_series(target, network, scraper, config, db, progress, error_log)
 
-    # ── All series from file ─────────────────────────────────────────────────
-    elif all_series:
-        path = pathlib.Path(list_file)
-        if not path.is_file():
-            typer.echo(f"List file not found: {path}"); raise typer.Exit(1)
-        urls = [line.strip() for line in path.read_text("utf-8").splitlines()
-                if line.strip() and not line.startswith("#")]
-        if not urls:
-            print("Series list is empty."); return
-        print(f"Found {len(urls)} series in list.\n")
-        if not typer.confirm("Download all? (This may take a very long time)"):
-            print("Aborted."); return
-        for i, u in enumerate(urls, 1):
-            print(f"\n[{i}/{len(urls)}] {u}")
-            try:
-                download_series(u, network, scraper, config, db, progress)
-            except Exception as e:
-                print(f"  ✗ Series failed: {e}")
+        # ── All series from file ─────────────────────────────────────────────
+        elif all_series:
+            path = pathlib.Path(list_file)
+            if not path.is_file():
+                typer.echo(f"List file not found: {path}"); raise typer.Exit(1)
+            urls = [line.strip() for line in path.read_text("utf-8").splitlines()
+                    if line.strip() and not line.startswith("#")]
+            if not urls:
+                print("Series list is empty."); return
+            print(f"Found {len(urls)} series in list.\n")
+            if not typer.confirm("Download all? (This may take a very long time)"):
+                print("Aborted."); return
+            for i, u in enumerate(urls, 1):
+                print(f"\n[{i}/{len(urls)}] {u}")
+                try:
+                    download_series(u, network, scraper, config, db, progress, error_log)
+                except Exception as e:
+                    print(f"  ✗ Series failed: {e}")
+                    error_log.add(u, u, f"Series-level failure: {e}\n{traceback.format_exc()}")
 
-    db.close()
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user.")
+
+    finally:
+        db.close()
+        if error_log.has_errors():
+            error_log.write("errors.txt")
+            error_log.print_summary()
 
 
 if __name__ == "__main__":
