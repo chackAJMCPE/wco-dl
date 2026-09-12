@@ -2,9 +2,7 @@
 wco-dl — download anime & cartoons from wco.tv
 """
 
-import io
 import json
-import logging
 import pathlib
 import re
 import shutil
@@ -26,6 +24,7 @@ from tqdm import tqdm
 # Suppress harmless Playwright asyncio cleanup warnings on Windows
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
+
 # ---------------------------------------------------------------------------
 # Terminal colours
 # ---------------------------------------------------------------------------
@@ -42,6 +41,7 @@ class C:
     DIM    = "\033[2m"   if _on else ""
     BOLD   = "\033[1m"   if _on else ""
     RESET  = "\033[0m"   if _on else ""
+
 
 class EpisodeLogger:
     """
@@ -63,7 +63,9 @@ class EpisodeLogger:
     def clear(self):
         self._buf.clear()
 
+
 logger = EpisodeLogger()
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -78,21 +80,6 @@ USER_AGENT = (
 AD_DOMAINS = {"ad.a-ads.com", "doubleclick.net", "googlesyndication.com", "adservice.google"}
 
 DEFAULT_SERIES_LIST = ".wco-dl/series_list.txt"
-
-# Show name aliases — maps any variant to a canonical name.
-# Japanese title variants, English title variants, OVAs and movies all
-# collapse to the same canonical name so the library stays tidy.
-# Key: lowercase slug words  →  Value: canonical title
-SHOW_ALIASES: dict[str, str] = {
-    # Re:Zero
-    "re zero kara hajimeru isekai seikatsu":         "Re:Zero",
-    "re zero starting life in another world":         "Re:Zero",
-    "rezero kara hajimeru isekai seikatsu":           "Re:Zero",
-    "rezero starting life in another world":          "Re:Zero",
-    # Slime
-    "tensei shitara slime datta ken":                 "That Time I Got Reincarnated as a Slime",
-    "that time i got reincarnated as a slime":        "That Time I Got Reincarnated as a Slime",
-}
 
 # URL slug fragments that mark an entry as a movie (not an OVA/season)
 MOVIE_SLUG_WORDS = {"movie", "film", "the-movie"}
@@ -337,8 +324,14 @@ class Network:
         if total is not None and resume_from == total:
             return filename
 
-        with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024,
-                  desc=label, initial=resume_from) as bar:
+        with tqdm(
+            total=total,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc=label,
+            initial=resume_from,
+        ) as bar:
             with open(dest, "ab") as fh:
                 for chunk in r.iter_content(1024):
                     fh.write(chunk)
@@ -360,20 +353,21 @@ class Network:
             else "https://embed.wcostream.com/"
         )
         try:
-            resolved = self.session.head(url, allow_redirects=True,
-                                         headers={"Referer": referer}).url
+            resolved = self.session.head(url, allow_redirects=True, headers={"Referer": referer}).url
         except Exception:
             resolved = url
         logger.debug(f"  HLS: {url[:60]} → {resolved[:60]}")
 
         proc = subprocess.Popen(
-            ["ffmpeg", "-y",
-             "-user_agent", USER_AGENT,
-             "-headers", f"Referer: {referer}\r\n",
-             "-i", resolved,
-             "-c", "copy", "-bsf:a", "aac_adtstoasc",
-             "-progress", "pipe:1",
-             str(dest)],
+            [
+                "ffmpeg", "-y",
+                "-user_agent", USER_AGENT,
+                "-headers", f"Referer: {referer}\r\n",
+                "-i", resolved,
+                "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                "-progress", "pipe:1",
+                str(dest),
+            ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         with self._proc_lock:
@@ -394,9 +388,12 @@ class Network:
         t.join(timeout=5)
 
         total = duration[0] if duration else 0
-        bar = tqdm(total=total, desc=label, unit="s",
-                   bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}s [{elapsed}<{remaining}]"
-                   ) if total else None
+        bar = tqdm(
+            total=total,
+            desc=label,
+            unit="s",
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}s [{elapsed}<{remaining}]",
+        ) if total else None
         if not bar:
             print(label)
 
@@ -421,8 +418,7 @@ class Network:
 
         if proc.returncode != 0:
             raise RuntimeError(
-                f"ffmpeg failed (exit code {proc.returncode})\n"
-                + "".join(stderr_lines[-20:])
+                f"ffmpeg failed (exit code {proc.returncode})\n" + "".join(stderr_lines[-20:])
             )
         return filename
 
@@ -440,39 +436,59 @@ class Network:
 # Metadata normalization
 # ---------------------------------------------------------------------------
 
-def normalize_show_name(raw: str) -> str:
+def title_from_slug(slug: str) -> str:
+    """Convert a URL slug to a stable display title without alias tables."""
+    text = re.sub(r"(?<=\d)-(?=\d)", ".", slug).replace("-", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text.title()
+
+
+def parse_series_name(url: str) -> str:
     """
-    Map a raw parsed show name to a canonical name.
-    Checks the SHOW_ALIASES table first, then returns the raw name.
+    Parse the series name once from a series URL.
+
+    This is the canonical series identity used by -ds and -da. Episode names
+    are deliberately ignored for series naming so different episode slugs,
+    alternate language suffixes, or episode titles cannot split one series into
+    multiple library entries.
     """
-    key = raw.lower().strip()
-    # Try full match
-    if key in SHOW_ALIASES:
-        return SHOW_ALIASES[key]
-    # Try stripping trailing OVA/Movie/Special suffixes before matching
-    stripped = re.sub(r"\s+(ova|movie|film|special|ova \d+|movie \d+).*$", "", key, flags=re.IGNORECASE).strip()
-    if stripped in SHOW_ALIASES:
-        return SHOW_ALIASES[stripped]
-    return raw
+    path = urlparse(url).path.strip("/")
+    parts = [part for part in path.split("/") if part]
+
+    # Typical series URL: /anime/<series-slug>/
+    if "anime" in parts:
+        idx = parts.index("anime")
+        if idx + 1 >= len(parts):
+            raise ValueError(f"Could not determine series name from URL: {url}")
+        slug = parts[idx + 1]
+    else:
+        slug = parts[-1] if parts else ""
+
+    # Series URLs may contain an accidental trailing marker. Do not allow it
+    # to become part of the canonical series name.
+    slug = re.sub(r"(?i)(?:-)?(?:season|episode|ova|movie|film).*$", "", slug).strip("-")
+    if not slug:
+        raise ValueError(f"Could not determine series name from URL: {url}")
+
+    return title_from_slug(slug)
 
 
 def parse_episode_meta(url: str) -> tuple[str, str, str]:
     """
-    Parse show name, season, and episode from a wco.tv URL slug.
-    Returns (show, season, episode) as clean strings.
+    Parse show name, season, and episode from a WCO episode URL.
 
-    Language suffixes ("English Subbed", "English Dubbed") are stripped
-    from show names. OVAs stay inside their show as a special season.
-    Movies get their own series entry.
+    This function is used for direct -de downloads. For full-series downloads,
+    the show name is supplied separately by parse_series_name(series_url), while
+    this function still supplies season/episode information for each episode URL.
     """
-    slug  = urlparse(url).path.strip("/")
-    text  = re.sub(r"(?<=\d)-(?=\d)", ".", slug).replace("-", " ").strip()
+    slug = urlparse(url).path.strip("/")
+    text = re.sub(r"(?<=\d)-(?=\d)", ".", slug).replace("-", " ").strip()
 
     # Strip trailing language suffix (case-insensitive)
-    text  = re.sub(r"\s+english\s+(subbed|dubbed)\s*$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s+english\s+(subbed|dubbed)\s*$", "", text, flags=re.IGNORECASE).strip()
 
     # Extract episode number (handles "Episode 1", "Episode 1A", "Episode 1.5" etc.)
-    ep_m  = re.search(r"\bepisode\s*(\d+(?:\.\d+)?[A-Za-z]?)\b", text, re.IGNORECASE)
+    ep_m = re.search(r"\bepisode\s*(\d+(?:\.\d+)?[A-Za-z]?)\b", text, re.IGNORECASE)
     ep_no = ep_m.group(1).upper() if ep_m else "0"
 
     # Extract season number
@@ -495,22 +511,19 @@ def parse_episode_meta(url: str) -> tuple[str, str, str]:
     else:
         show_raw = text.strip()
 
-    show_raw  = re.sub(r"\s+", " ", show_raw).title()
-    show      = normalize_show_name(show_raw)
+    show = title_from_slug(show_raw)
 
     if is_movie:
-        # Movies get their own series so they don't clutter episode lists
-        season  = "Movies"
+        season = "Movies"
         episode = f"Episode {ep_no}"
     elif is_ova:
-        # OVAs stay inside the show as a dedicated season
-        season  = "OVA"
+        season = "OVA"
         episode = f"OVA {ep_no}"
     elif sea_no:
-        season  = f"Season {sea_no}"
+        season = f"Season {sea_no}"
         episode = f"Episode {ep_no}"
     else:
-        season  = "Season 1"
+        season = "Season 1"
         episode = f"Episode {ep_no}"
 
     return show, season, episode
@@ -595,14 +608,14 @@ class Scraper:
         return self._extract_legacy(embed_url)
 
     def _extract_legacy(self, embed_url: str) -> list[dict]:
-        parsed      = urlparse(embed_url)
-        query       = parse_qs(parsed.query, keep_blank_values=True)
-        file_param  = query.get("file",  [""])[0]
+        parsed = urlparse(embed_url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        file_param = query.get("file", [""])[0]
         embed_param = query.get("embed", [""])[0]
-        hd_param    = query.get("hd",    [""])[0]   # only send if present in URL
-        pid_param   = query.get("pid",   [""])[0]
-        h_param     = query.get("h",     [""])[0]
-        t_param     = query.get("t",     [""])[0]
+        hd_param = query.get("hd", [""])[0]
+        pid_param = query.get("pid", [""])[0]
+        h_param = query.get("h", [""])[0]
+        t_param = query.get("t", [""])[0]
 
         if not file_param:
             raise ValueError(f"No 'file' param in embed URL: {embed_url[:80]}")
@@ -623,17 +636,22 @@ class Scraper:
         v_encoded = quote(video_path, safe="/")
 
         qs = f"v={v_encoded}&embed={embed_param}"
-        if hd_param:    qs += f"&hd={hd_param}"
-        if pid_param:   qs += f"&pid={pid_param}"
-        if h_param:     qs += f"&h={h_param}"
-        if t_param:     qs += f"&t={t_param}"
+        if hd_param:
+            qs += f"&hd={hd_param}"
+        if pid_param:
+            qs += f"&pid={pid_param}"
+        if h_param:
+            qs += f"&h={h_param}"
+        if t_param:
+            qs += f"&t={t_param}"
 
         getvidlink = urljoin(f"{parsed.scheme}://{parsed.netloc}", "/inc/embed/getvidlink.php")
 
         # Referer must be video-js.php (the actual player page), not index.php
         video_js_url = (
             urljoin(f"{parsed.scheme}://{parsed.netloc}", "/inc/embed/video-js.php")
-            + "?" + parsed.query.replace("%20", "+")
+            + "?"
+            + parsed.query.replace("%20", "+")
         )
 
         # Load index.php as the browser would (cross-site iframe) to set PHPSESSID
@@ -668,10 +686,10 @@ class Scraper:
         logger.debug(f"  getvidlink: {getvidlink}?{qs[:120]}")
         resp = self.net.raw_get(f"{getvidlink}?{qs}", headers=xhr_headers)
         data = resp.json()
-        enc       = data.get("enc", "")
-        server    = data.get("server", "")
-        hd_token  = data.get("hd",    "")
-        fhd_token = data.get("fhd",   "")
+        enc = data.get("enc", "")
+        server = data.get("server", "")
+        hd_token = data.get("hd", "")
+        fhd_token = data.get("fhd", "")
 
         logger.debug(
             f"  getvidlink OK  server={server!r}  "
@@ -810,8 +828,7 @@ class Scraper:
             browser.close()
 
         hls_url = next(
-            (e["url"] for e in player_sources
-             if ".m3u8" in e.get("url", "") and "blob:" not in e["url"]),
+            (e["url"] for e in player_sources if ".m3u8" in e.get("url", "") and "blob:" not in e["url"]),
             next((u for u in captured_m3u8 if u.startswith("http")), ""),
         )
         if not hls_url:
@@ -826,14 +843,16 @@ class Scraper:
 
     def select_resolution(self, sources: list[dict], preference: str) -> dict:
         mapping = {"sd": "480p", "hd": "720p", "fhd": "1080p"}
-        target  = mapping.get(preference.lower())
+        target = mapping.get(preference.lower())
         if target:
             match = next((s for s in sources if s["label"] == target), None)
             if match:
                 return match
+
         def _res(s: dict) -> int:
             m = re.search(r"(\d+)", s.get("label", "0"))
             return int(m.group(1)) if m else 0
+
         return max(sources, key=_res)
 
     def search(self, query: str) -> list[str]:
@@ -883,7 +902,7 @@ class ErrorLog:
     def print_summary(self):
         """Print a red warning to the terminal if any errors occurred."""
         if self._entries:
-            RED   = "\033[91m"
+            RED = "\033[91m"
             RESET = "\033[0m"
             print(
                 f"\n{RED}Errors occurred during download of some episodes. "
@@ -902,24 +921,29 @@ def download_episode(
     config: Config,
     db: LibraryDB,
     progress: Progress,
+    series_name: str | None = None,
 ) -> tuple[bool, str, str]:
     """
     Returns (success, short_message, error_detail).
-    short_message is always shown in the terminal.
-    error_detail is non-empty only on failure and goes to errors.txt.
+
+    If series_name is supplied (the -ds/-da path), that name is used for the
+    database/library entry and is never re-derived from the individual episode
+    slug. If series_name is None (the -de path), the episode URL supplies the
+    series name as before.
     """
     # Step 1: get embed URL (catches premium episodes)
     try:
         embed_url = scraper.get_embed_url(url)
     except RuntimeError as e:
-        debug_log = logger.flush()
+        logger.flush()
         if "Premium episode" in str(e):
             return False, "⏭  Skipped  — premium only", ""
         detail = f"Could not load page: {e}\n{traceback.format_exc()}"
         return False, "✗  Failed   — could not load page", detail
 
-    # Step 2: parse episode metadata
-    show, season, episode = parse_episode_meta(url)
+    # Step 2: parse metadata
+    parsed_show, season, episode = parse_episode_meta(url)
+    show = series_name if series_name is not None else parsed_show
     language = detect_language(url, episode)
     logger.debug(f"── {show} / {season} / {episode} ({language}) ──")
 
@@ -937,14 +961,14 @@ def download_episode(
         detail = f"Source extraction failed: {e}\n{traceback.format_exc()}"
         return False, "✗  Failed   — source extraction error", detail
 
-    source   = scraper.select_resolution(sources, config.settings.resolution)
-    media    = source["url"]
-    is_hls   = ".m3u8" in media
+    source = scraper.select_resolution(sources, config.settings.resolution)
+    media = source["url"]
+    is_hls = ".m3u8" in media
     hex_name = db.get_next_filename()
-    folder   = config.settings.download_folder
-    temp     = pathlib.Path(folder) / f"{hex_name}.part"
-    final    = pathlib.Path(folder) / hex_name
-    label    = f"{show} — {season} {episode} [{language}]"
+    folder = config.settings.download_folder
+    temp = pathlib.Path(folder) / f"{hex_name}.part"
+    final = pathlib.Path(folder) / hex_name
+    label = f"{show} — {season} {episode} [{language}]"
 
     progress.add_pending(url)
 
@@ -978,20 +1002,36 @@ def download_series(
     progress: Progress,
     error_log: ErrorLog,
 ) -> None:
+    # The series URL is the single source of truth for the series name.
+    # Parse it once and reuse it for every episode in this run.
+    series_name = parse_series_name(url)
+    print(f"  Series name: {series_name}")
     print(f"  Fetching episode list...")
+
     episodes = scraper.get_episodes(url)
     if not episodes:
         print(f"  No episodes found.")
         return
+
     print(f"  Found {len(episodes)} episode(s). Starting download...\n")
     ok = skip = fail = 0
     for i, (ep_url, label) in enumerate(episodes, 1):
         print(f"  [{i:>3}/{len(episodes)}] {label}")
-        success, msg, detail = download_episode(ep_url, network, scraper, config, db, progress)
+        success, msg, detail = download_episode(
+            ep_url,
+            network,
+            scraper,
+            config,
+            db,
+            progress,
+            series_name=series_name,
+        )
         print(f"         {msg}")
         if success:
-            if "Skipped" in msg: skip += 1
-            else: ok += 1
+            if "Skipped" in msg:
+                skip += 1
+            else:
+                ok += 1
         else:
             if "premium" in msg or "Skipped" in msg:
                 skip += 1
@@ -1012,22 +1052,22 @@ app = typer.Typer(
 
 
 def _init() -> tuple[Config, Network, Scraper, LibraryDB, Progress]:
-    config  = Config()
+    config = Config()
     network = Network()
     scraper = Scraper(network)
-    db      = LibraryDB(config)
-    prog    = Progress(config)
+    db = LibraryDB(config)
+    prog = Progress(config)
     return config, network, scraper, db, prog
 
 
 @app.command()
 def main(
-    target:     str  = typer.Argument(None),
-    search:     bool = typer.Option(False, "--search",  "-s",  help="Search for a show"),
-    episode:    bool = typer.Option(False, "--episode", "-de", help="Download a single episode URL"),
-    series:     bool = typer.Option(False, "--series",  "-ds", help="Download a full series URL"),
-    all_series: bool = typer.Option(False, "--all",     "-da", help="Download all series from list file"),
-    list_file:  str  = typer.Option(DEFAULT_SERIES_LIST, "--list-file", help="Series list file (one URL per line)"),
+    target: str = typer.Argument(None),
+    search: bool = typer.Option(False, "--search", "-s", help="Search for a show"),
+    episode: bool = typer.Option(False, "--episode", "-de", help="Download a single episode URL"),
+    series: bool = typer.Option(False, "--series", "-ds", help="Download a full series URL"),
+    all_series: bool = typer.Option(False, "--all", "-da", help="Download all series from list file"),
+    list_file: str = typer.Option(DEFAULT_SERIES_LIST, "--list-file", help="Series list file (one URL per line)"),
 ):
     """
     wco-dl — download anime & cartoons from wco.tv
@@ -1056,7 +1096,8 @@ def main(
         # ── Search ──────────────────────────────────────────────────────────
         if search:
             if not target:
-                typer.echo("--search requires a query"); raise typer.Exit(1)
+                typer.echo("--search requires a query")
+                raise typer.Exit(1)
             print(f"Searching for '{target}'...")
             results = scraper.search(target)
             if not results:
@@ -1071,10 +1112,19 @@ def main(
         # ── Single episode ───────────────────────────────────────────────────
         elif episode:
             if not target:
-                typer.echo("--episode requires a URL"); raise typer.Exit(1)
+                typer.echo("--episode requires a URL")
+                raise typer.Exit(1)
             show, season, ep = parse_episode_meta(target)
             print(f"Downloading: {show} — {season} {ep}")
-            success, msg, detail = download_episode(target, network, scraper, config, db, progress)
+            success, msg, detail = download_episode(
+                target,
+                network,
+                scraper,
+                config,
+                db,
+                progress,
+                series_name=None,
+            )
             print(f"  {msg}")
             if not success and detail:
                 error_log.add(f"{show} — {season} {ep}", target, detail, logger.flush())
@@ -1082,22 +1132,30 @@ def main(
         # ── Full series ──────────────────────────────────────────────────────
         elif series:
             if not target:
-                typer.echo("--series requires a URL"); raise typer.Exit(1)
-            print(f"Series: {target}")
+                typer.echo("--series requires a URL")
+                raise typer.Exit(1)
+            series_name = parse_series_name(target)
+            print(f"Series: {series_name}")
             download_series(target, network, scraper, config, db, progress, error_log)
 
         # ── All series from file ─────────────────────────────────────────────
         elif all_series:
             path = pathlib.Path(list_file)
             if not path.is_file():
-                typer.echo(f"List file not found: {path}"); raise typer.Exit(1)
-            urls = [line.strip() for line in path.read_text("utf-8").splitlines()
-                    if line.strip() and not line.startswith("#")]
+                typer.echo(f"List file not found: {path}")
+                raise typer.Exit(1)
+            urls = [
+                line.strip()
+                for line in path.read_text("utf-8").splitlines()
+                if line.strip() and not line.startswith("#")
+            ]
             if not urls:
-                print("Series list is empty."); return
+                print("Series list is empty.")
+                return
             print(f"Found {len(urls)} series in list.\n")
             if not typer.confirm("Download all? (This may take a very long time)"):
-                print("Aborted."); return
+                print("Aborted.")
+                return
             for i, u in enumerate(urls, 1):
                 print(f"\n[{i}/{len(urls)}] {u}")
                 try:
