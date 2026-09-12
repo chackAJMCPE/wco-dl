@@ -6,6 +6,7 @@ Displays series, seasons, episodes with language, and allows playing episodes.
 
 import os
 import pathlib
+import re
 import sqlite3
 import subprocess
 import sys
@@ -142,7 +143,8 @@ def main() -> None:
                     print("No episodes in this season.")
                     break
                 for k, (ep_id, ep_name, filename, lang) in enumerate(episodes, 1):
-                    print(f"{k}. {ep_name} ({lang})")
+                    display_name = re.sub(r"\s*\[[^\]]+\]$", "", ep_name)
+                    print(f"{k}. {display_name} ({lang})")
                 print("  b / back  to go back to seasons")
                 ep_choice = input("Choose episode number to play (or 'b'): ").strip().lower()
                 if ep_choice == "b":
