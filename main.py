@@ -466,13 +466,13 @@ def parse_episode_meta(url: str) -> tuple[str, str, str]:
     Movies get their own series entry.
     """
     slug  = urlparse(url).path.strip("/")
-    text  = slug.replace("-", " ").strip()
+    text  = re.sub(r"(?<=\d)-(?=\d)", ".", slug).replace("-", " ").strip()
 
     # Strip trailing language suffix (case-insensitive)
     text  = re.sub(r"\s+english\s+(subbed|dubbed)\s*$", "", text, flags=re.IGNORECASE).strip()
 
-    # Extract episode number (handles "Episode 1", "Episode 1A", "Episode 1B" etc.)
-    ep_m  = re.search(r"\bepisode\s*(\d+[A-Za-z]?)\b", text, re.IGNORECASE)
+    # Extract episode number (handles "Episode 1", "Episode 1A", "Episode 1.5" etc.)
+    ep_m  = re.search(r"\bepisode\s*(\d+(?:\.\d+)?[A-Za-z]?)\b", text, re.IGNORECASE)
     ep_no = ep_m.group(1).upper() if ep_m else "0"
 
     # Extract season number
@@ -488,7 +488,7 @@ def parse_episode_meta(url: str) -> tuple[str, str, str]:
 
     # Extract show name: everything before season/episode/ova/movie marker
     name_end = re.search(
-        r"\b(season|episode|ova|movie|film|part\s*\d)\b", text, re.IGNORECASE
+        r"\b(season|episode|ova|movie|film|part\s*\d+(?:\.\d+)?)\b", text, re.IGNORECASE
     )
     if name_end:
         show_raw = text[:name_end.start()].strip()
