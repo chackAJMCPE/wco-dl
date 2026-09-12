@@ -1,18 +1,4 @@
-"""
-wco-dl — download anime & cartoons from wco.tv
-
-The legacy WCO player flow mirrors the current embed JavaScript:
-
-    getvidlink.php
-        ├─ response.server + /getvid?evid=<SD_TOKEN>&json -> redirected MP4 URL
-        ├─ response.server + /getvid?evid=<HD_TOKEN>      -> media redirect
-        └─ response.server + /getvid?evid=<FHD_TOKEN>     -> media redirect
-
-The player also exposes response.cdn. It is retained as a fallback resolver,
-not substituted for response.server, because the current player explicitly
-builds its media URLs from response.server.
-"""
-
+import concurrent.futures
 import json
 import pathlib
 import re
@@ -22,7 +8,7 @@ import subprocess
 import threading
 import traceback
 import warnings
-from urllib.parse import parse_qs, quote, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import bs4
 import cloudscraper
@@ -53,22 +39,32 @@ class C:
     RESET = "\033[0m" if _on else ""
 
 
+# ---------------------------------------------------------------------------
+# Per-episode debug logging
+# ---------------------------------------------------------------------------
+
 class EpisodeLogger:
-    """Buffers debug lines for the current episode."""
+    """Thread-safe debug logger with per-thread buffers."""
 
     def __init__(self):
-        self._buf: list[str] = []
+        self._local = threading.local()
+
+    def _buf(self) -> list[str]:
+        if not hasattr(self._local, "buf"):
+            self._local.buf = []
+        return self._local.buf
 
     def debug(self, msg: str):
-        self._buf.append(msg)
+        self._buf().append(msg)
 
     def flush(self) -> str:
-        out = "\n".join(self._buf)
-        self._buf.clear()
+        buf = self._buf()
+        out = "\n".join(buf)
+        buf.clear()
         return out
 
     def clear(self):
-        self._buf.clear()
+        self._buf().clear()
 
 
 logger = EpisodeLogger()
@@ -132,26 +128,31 @@ class Progress:
             else {"pending": []}
         )
         self._data.setdefault("pending", [])
+        self._lock = threading.Lock()
 
     def _save(self):
         self._path.write_text(json.dumps(self._data, indent=2), "utf-8")
 
     def add_pending(self, url: str):
-        if url not in self._data["pending"]:
-            self._data["pending"].append(url)
-            self._save()
+        with self._lock:
+            if url not in self._data["pending"]:
+                self._data["pending"].append(url)
+                self._save()
 
     def remove_pending(self, url: str):
-        if url in self._data["pending"]:
-            self._data["pending"].remove(url)
-            self._save()
+        with self._lock:
+            if url in self._data["pending"]:
+                self._data["pending"].remove(url)
+                self._save()
 
     def get_pending(self) -> list[str]:
-        return self._data["pending"].copy()
+        with self._lock:
+            return self._data["pending"].copy()
 
     def clear_pending(self):
-        self._data["pending"] = []
-        self._save()
+        with self._lock:
+            self._data["pending"] = []
+            self._save()
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +163,11 @@ class LibraryDB:
     def __init__(self, config: Config):
         self.download_folder = pathlib.Path(config.settings.download_folder)
         self.download_folder.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.download_folder / "library.db"))
+        self.conn = sqlite3.connect(
+            str(self.download_folder / "library.db"),
+            check_same_thread=False,
+        )
+        self._lock = threading.Lock()
         self.conn.row_factory = sqlite3.Row
         self._init()
 
@@ -201,12 +206,13 @@ class LibraryDB:
         self.conn.commit()
 
     def get_next_filename(self) -> str:
-        cur = self.conn.execute(
-            "UPDATE meta SET value = CAST(value AS INTEGER) + 1 "
-            "WHERE key = 'file_counter' RETURNING CAST(value AS INTEGER)"
-        )
-        new_val = cur.fetchone()[0]
-        self.conn.commit()
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE meta SET value = CAST(value AS INTEGER) + 1 "
+                "WHERE key = 'file_counter' RETURNING CAST(value AS INTEGER)"
+            )
+            new_val = cur.fetchone()[0]
+            self.conn.commit()
         return f"{new_val - 1:08x}.mp4"
 
     def add_episode(
@@ -217,24 +223,25 @@ class LibraryDB:
         filename: str,
         language: str,
     ):
-        self.conn.execute("INSERT OR IGNORE INTO series (name) VALUES (?)", (series,))
-        series_id = self.conn.execute(
-            "SELECT id FROM series WHERE name = ?", (series,)
-        ).fetchone()[0]
-        self.conn.execute(
-            "INSERT OR IGNORE INTO seasons (series_id, name) VALUES (?, ?)",
-            (series_id, season),
-        )
-        season_id = self.conn.execute(
-            "SELECT id FROM seasons WHERE series_id = ? AND name = ?",
-            (series_id, season),
-        ).fetchone()[0]
-        self.conn.execute(
-            "INSERT OR REPLACE INTO episodes "
-            "(season_id, episode_name, filename, language) VALUES (?, ?, ?, ?)",
-            (season_id, f"{episode} [{language}]", filename, language),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute("INSERT OR IGNORE INTO series (name) VALUES (?)", (series,))
+            series_id = self.conn.execute(
+                "SELECT id FROM series WHERE name = ?", (series,)
+            ).fetchone()[0]
+            self.conn.execute(
+                "INSERT OR IGNORE INTO seasons (series_id, name) VALUES (?, ?)",
+                (series_id, season),
+            )
+            season_id = self.conn.execute(
+                "SELECT id FROM seasons WHERE series_id = ? AND name = ?",
+                (series_id, season),
+            ).fetchone()[0]
+            self.conn.execute(
+                "INSERT OR REPLACE INTO episodes "
+                "(season_id, episode_name, filename, language) VALUES (?, ?, ?, ?)",
+                (season_id, f"{episode} [{language}]", filename, language),
+            )
+            self.conn.commit()
 
     def get_episode_filename(
         self,
@@ -243,19 +250,23 @@ class LibraryDB:
         episode: str,
         language: str,
     ) -> str | None:
-        row = self.conn.execute(
-            """SELECT e.filename FROM episodes e
-               JOIN seasons s   ON e.season_id  = s.id
-               JOIN series ser  ON s.series_id  = ser.id
-               WHERE ser.name = ? AND s.name = ? AND e.episode_name = ?""",
-            (series, season, f"{episode} [{language}]"),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT e.filename FROM episodes e
+                   JOIN seasons s   ON e.season_id  = s.id
+                   JOIN series ser  ON s.series_id  = ser.id
+                   WHERE ser.name = ? AND s.name = ? AND e.episode_name = ?""",
+                (series, season, f"{episode} [{language}]"),
+            ).fetchone()
         return row[0] if row else None
 
     def cleanup_orphaned(self):
         for f in self.download_folder.glob("*.part"):
-            f.unlink()
-            logger.debug(f"  Cleaned up orphaned file: {f.name}")
+            try:
+                f.unlink()
+                logger.debug(f"  Cleaned up orphaned file: {f.name}")
+            except OSError:
+                pass
 
     def close(self):
         self.conn.close()
@@ -272,6 +283,7 @@ class Network:
         )
         self.session.headers.update({"User-Agent": USER_AGENT})
         self._primed_servers: set[str] = set()
+        self._prime_lock = threading.Lock()
         self._active_procs: list[subprocess.Popen] = []
         self._proc_lock = threading.Lock()
 
@@ -350,29 +362,28 @@ class Network:
         return bool(re.match(r"^(?:d|nd|m)\d+\.", host, re.IGNORECASE))
 
     def prime_server(self, server_url: str):
-        """Prime a resolver/CDN without caching individual delivery nodes."""
+        """Prime a resolver/CDN without caching token-specific delivery nodes."""
         parsed = urlparse(server_url)
         host = parsed.hostname or ""
         if self._is_delivery_node(host):
-            # Delivery nodes are token-specific. Do not treat one node as a
-            # reusable resolver endpoint.
             return
-        if server_url in self._primed_servers:
-            return
-        try:
-            self.session.get(
-                server_url,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Referer": "https://embed.wcostream.com/",
-                },
-                timeout=10,
-                allow_redirects=True,
-            )
-            self._primed_servers.add(server_url)
-            logger.debug(f"  CDN primed: {server_url}")
-        except Exception as e:
-            logger.debug(f"  CDN priming failed (non-fatal): {e}")
+        with self._prime_lock:
+            if server_url in self._primed_servers:
+                return
+            try:
+                self.session.get(
+                    server_url,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Referer": "https://embed.wcostream.com/",
+                    },
+                    timeout=10,
+                    allow_redirects=True,
+                )
+                self._primed_servers.add(server_url)
+                logger.debug(f"  CDN primed: {server_url}")
+            except Exception as e:
+                logger.debug(f"  CDN priming failed (non-fatal): {e}")
 
     @staticmethod
     def _looks_like_html(response: requests.Response) -> bool:
@@ -416,8 +427,6 @@ class Network:
             f"{r.headers.get('Content-Type', 'N/A')}"
         )
 
-        # A ranged request returning 200 means the server ignored Range. Do not
-        # append a complete file to a partial file.
         if resume_from and r.status_code == 200:
             logger.debug("  Range ignored by server; restarting download from byte 0")
             r.close()
@@ -719,20 +728,47 @@ class Scraper:
         return episodes
 
     def get_embed_url(self, episode_url: str) -> str:
+        html = self._fetch_episode_page(episode_url)
+        src = self._extract_iframe_src(html, episode_url)
+        if src:
+            return src
+
+        logger.debug("  HTTP fetch missed iframe, falling back to Playwright")
         html = self.net.get_rendered_page(episode_url)
+        src = self._extract_iframe_src(html, episode_url)
+        if src:
+            return src
+        raise RuntimeError("No embed iframe found on page")
+
+    def _fetch_episode_page(self, url: str) -> str:
+        try:
+            r = self.net.session.get(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://www.wco.tv/",
+                },
+                allow_redirects=True,
+                timeout=15,
+            )
+            return r.text
+        except Exception as e:
+            logger.debug(f"  HTTP episode fetch failed: {e}")
+            return ""
+
+    def _extract_iframe_src(self, html: str, episode_url: str) -> str | None:
+        if not html:
+            return None
         soup = bs4.BeautifulSoup(html, "html.parser")
         all_iframes = soup.find_all("iframe")
 
         for i, fr in enumerate(all_iframes):
             logger.debug(
-                f"  iframe #{i}  id={fr.get('id', '(none)')} "
-                f"src={fr.get('src', '')[:120]}"
+                f"  iframe #{i}  id={fr.get('id', '(none)')}  src={fr.get('src', '')[:120]}"
             )
 
-        if (
-            "Become a Premium User Now!" in html
-            or "This Video Is for Premium Users" in html
-        ):
+        if "Become a Premium User Now!" in html or "This Video Is for Premium Users" in html:
             raise RuntimeError("Premium episode, skipping")
 
         iframe = (
@@ -742,16 +778,22 @@ class Scraper:
                 (
                     fr
                     for fr in all_iframes
-                    if fr.get("src")
-                    and not any(ad in fr["src"] for ad in AD_DOMAINS)
+                    if fr.get("src") and not any(ad in fr["src"] for ad in AD_DOMAINS)
                 ),
                 None,
             )
         )
         if iframe is None:
-            raise RuntimeError("No embed iframe found on page")
+            return None
 
         src = iframe["src"]
+        if src.startswith("//"):
+            parsed = urlparse(episode_url)
+            src = f"{parsed.scheme}:{src}"
+        elif src.startswith("/"):
+            parsed = urlparse(episode_url)
+            src = f"{parsed.scheme}://{parsed.netloc}{src}"
+
         logger.debug(f"  Selected embed: {src[:140]}")
         return src
 
@@ -784,15 +826,12 @@ class Scraper:
         return Network._is_delivery_node(host)
 
     def _extract_legacy(self, embed_url: str) -> list[dict]:
-        """Extract legacy MP4 sources using the current WCO player protocol."""
+        """Extract legacy WCO sources using the current browser-verified player protocol."""
         parsed = urlparse(embed_url)
         query = parse_qs(parsed.query, keep_blank_values=True)
 
         file_param = query.get("file", [""])[0]
         embed_param = query.get("embed", [""])[0]
-        pid_param = query.get("pid", [""])[0]
-        h_param = query.get("h", [""])[0]
-        t_param = query.get("t", [""])[0]
 
         if not file_param:
             raise ValueError(f"No 'file' param in embed URL: {embed_url[:100]}")
@@ -804,19 +843,13 @@ class Scraper:
         else:
             video_path = f"{embed_param}/{base}"
 
-        # Matches the current player:
-        # /inc/embed/getvidlink.php?v=<path>&embed=<embed>&hd=1
+        # Match the actual browser request captured in the supplied HAR.
+        # The working player calls getvidlink.php with only v + embed for
+        # this request. pid/h/t/hd are not required for the resolver call.
         params = [
             f"v={quote(video_path, safe='/')}",
             f"embed={quote(embed_param, safe='')}",
-            "hd=1",
         ]
-        if pid_param:
-            params.append(f"pid={quote(pid_param, safe='')}")
-        if h_param:
-            params.append(f"h={quote(h_param, safe='')}")
-        if t_param:
-            params.append(f"t={quote(t_param, safe='')}")
 
         embed_origin = f"{parsed.scheme}://{parsed.netloc}"
         getvidlink = urljoin(embed_origin, "/inc/embed/getvidlink.php")
@@ -874,6 +907,7 @@ class Scraper:
         except Exception as e:
             logger.debug(f"  video-js.php preload failed (non-fatal): {e}")
 
+        # These headers mirror the browser's XHR/fetch request closely.
         xhr_headers = {
             "User-Agent": USER_AGENT,
             "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -901,6 +935,8 @@ class Scraper:
             raise RuntimeError(
                 f"getvidlink returned non-JSON response: {resp.text[:500]}"
             ) from e
+        finally:
+            resp.close()
 
         logger.debug(
             "  getvidlink JSON:\n"
@@ -915,9 +951,6 @@ class Scraper:
         server = self._normalise_origin(data.get("server"))
         cdn = self._normalise_origin(data.get("cdn"))
 
-        # This is the critical detail from the supplied player source:
-        #   const videoUrl = server + '/getvid?evid=' + vsd + '&json';
-        #   sources use server + '/getvid?evid=' + vhd/vfhd.
         if not server:
             raise RuntimeError(
                 "getvidlink returned no usable 'server' field\n"
@@ -953,8 +986,15 @@ class Scraper:
 
         sources: list[dict] = []
 
-        # SD: current player explicitly resolves through &json and expects
-        # the response body to be the redirected MP4 URL.
+        # ------------------------------------------------------------------
+        # SD: THIS IS THE CORE FIX.
+        #
+        # WCO's /getvid?...&json endpoint returns JSON while advertising the
+        # response as text/html. The browser does response.json() regardless.
+        # Never reject this resolver response solely because of its MIME type.
+        # The response is a JSON string containing the token-specific delivery
+        # URL, e.g. https://nd01.wcostream.com/getvid?evid=...
+        # ------------------------------------------------------------------
         if enc:
             sd_url = self._resolve_json_token(
                 server,
@@ -962,23 +1002,36 @@ class Scraper:
                 resolver_headers,
                 fallback_servers=[cdn] if cdn else [],
             )
-            if sd_url:
-                sources.append({"label": "480p", "url": sd_url, "fallback_urls": []})
+            if not sd_url:
+                raise RuntimeError(
+                    "WCO SD resolver returned no usable media URL. "
+                    "The direct /getvid?evid=... fallback is intentionally disabled "
+                    "because it does not reproduce the working browser flow."
+                )
+            sources.append({
+                "label": "480p",
+                "url": sd_url,
+                "fallback_urls": [],
+            })
 
-        # HD/FHD: current player feeds server/getvid directly to Video.js and
-        # lets the browser follow the delivery-node redirect.
+        # HD/FHD: the player uses the server/getvid endpoint directly and lets
+        # the browser follow the token-specific delivery-node redirect.
         fallback_hosts = [h for h in (cdn,) if h and h != server]
         if hd_token:
             sources.append({
                 "label": "720p",
                 "url": self._build_token_url(server, hd_token),
-                "fallback_urls": [self._build_token_url(h, hd_token) for h in fallback_hosts],
+                "fallback_urls": [
+                    self._build_token_url(h, hd_token) for h in fallback_hosts
+                ],
             })
         if fhd_token:
             sources.append({
                 "label": "1080p",
                 "url": self._build_token_url(server, fhd_token),
-                "fallback_urls": [self._build_token_url(h, fhd_token) for h in fallback_hosts],
+                "fallback_urls": [
+                    self._build_token_url(h, fhd_token) for h in fallback_hosts
+                ],
             })
 
         deduped: list[dict] = []
@@ -1009,17 +1062,18 @@ class Scraper:
         headers: dict,
         fallback_servers: list[str] | None = None,
     ) -> str | None:
-        """Resolve an SD WCO token via the player's `&json` endpoint."""
+        """Resolve an SD WCO token exactly like the browser's fetchJsonData()."""
         candidates: list[str] = []
         for value in [server, *(fallback_servers or [])]:
             value = self._normalise_origin(value)
             if value and value not in candidates:
                 candidates.append(value)
 
-        response = None
         for base in candidates:
             url = self._build_token_url(base, token) + "&json"
             logger.debug(f"  SD resolver: {url[:180]}")
+
+            response: requests.Response | None = None
             try:
                 response = self.net.session.get(
                     url,
@@ -1038,38 +1092,55 @@ class Scraper:
                     )
                     continue
 
-                if self.net._looks_like_html(response):
-                    preview = response.text[:300].replace("\n", " ")
-                    logger.debug(f"  SD resolver returned HTML: {preview!r}")
-                    continue
-
+                # IMPORTANT: do NOT use _looks_like_html() here.
+                # The supplied working HAR proves that this endpoint returns
+                # application/json/text containing a JSON string while the
+                # Content-Type may be text/html.
                 try:
                     payload = response.json()
-                except Exception:
-                    payload = response.text.strip().strip('"')
+                except ValueError:
+                    raw = response.text.strip()
+                    logger.debug(
+                        f"  SD resolver JSON decode failed; raw body preview: {raw[:500]!r}"
+                    )
+                    payload = raw
 
-                candidate = None
+                logger.debug(f"  SD resolver payload: {payload!r}")
+
+                candidate: str | None = None
+
                 if isinstance(payload, str):
-                    candidate = payload
+                    candidate = payload.strip().strip('"\'')
                 elif isinstance(payload, dict):
                     for key in ("url", "src", "file", "media", "redirect", "location"):
                         value = payload.get(key)
                         if isinstance(value, str):
-                            candidate = value
+                            candidate = value.strip()
                             break
 
-                if not candidate or not candidate.startswith(("http://", "https://")):
-                    logger.debug(f"  SD resolver returned no absolute URL: {payload!r}")
+                if not candidate:
+                    logger.debug("  SD resolver returned no usable string")
                     continue
 
+                candidate = candidate.replace("\\/", "/")
                 candidate = candidate.replace("&json", "").replace("?json", "")
-                host = (urlparse(candidate).hostname or "").lower()
-                logger.debug(f"  SD resolved URL: {candidate[:160]}")
 
+                if not candidate.startswith(("http://", "https://")):
+                    logger.debug(
+                        f"  SD resolver returned non-absolute URL: {candidate!r}"
+                    )
+                    continue
+
+                host = (urlparse(candidate).hostname or "").lower()
+                logger.debug(f"  SD resolved URL: {candidate[:180]}")
+
+                # Same capacity-node concept used by the player. Never treat
+                # an apex/no-subdomain response as a usable media URL.
                 if self._is_wco_capacity_host(host):
                     logger.debug(f"  SD resolver returned capacity host: {host}")
                     continue
 
+                # Preserve the exact token-specific URL returned by the server.
                 return candidate
 
             except Exception as e:
@@ -1080,7 +1151,6 @@ class Scraper:
                         response.close()
                     except Exception:
                         pass
-                    response = None
 
         return None
 
@@ -1183,7 +1253,6 @@ class Scraper:
         if not hls_url:
             raise RuntimeError("Saturn embed: no HLS URL found")
 
-        # Preserve the original path structure but replace the quality segment.
         m = re.match(r"^(.*?/0/)(?:\d+)(/index\.m3u8)$", hls_url)
         if m:
             prefix, suffix = m.groups()
@@ -1233,6 +1302,7 @@ class Scraper:
 class ErrorLog:
     def __init__(self):
         self._entries: list[str] = []
+        self._lock = threading.Lock()
 
     def add(self, episode_label: str, url: str, detail: str, debug_log: str = ""):
         entry = (
@@ -1242,20 +1312,24 @@ class ErrorLog:
         )
         if debug_log:
             entry += f"\nDebug log:\n{debug_log}\n"
-        self._entries.append(entry)
+        with self._lock:
+            self._entries.append(entry)
 
     def has_errors(self) -> bool:
-        return bool(self._entries)
+        with self._lock:
+            return bool(self._entries)
 
     def write(self, path: str = "errors.txt"):
+        with self._lock:
+            entries = list(self._entries)
         p = pathlib.Path(path)
         with p.open("w", encoding="utf-8") as f:
             f.write(f"wco-dl error log\n{'─' * 60}\n\n")
-            for i, entry in enumerate(self._entries, 1):
+            for i, entry in enumerate(entries, 1):
                 f.write(f"[{i}]\n{entry}\n")
 
     def print_summary(self):
-        if self._entries:
+        if self.has_errors():
             print(
                 f"\n{C.RED}Errors occurred during download of some episodes. "
                 f"Check the specifics in errors.txt{C.RESET}"
@@ -1275,6 +1349,8 @@ def download_episode(
     progress: Progress,
     series_name: str | None = None,
 ) -> tuple[bool, str, str]:
+    logger.clear()
+
     try:
         embed_url = scraper.get_embed_url(url)
     except RuntimeError as e:
@@ -1325,9 +1401,6 @@ def download_episode(
 
     try:
         candidates = [media, *source.get("fallback_urls", [])]
-        # Preserve order while removing duplicates. The first URL is always the
-        # exact URL the player would normally use. Fallbacks are only attempted
-        # after a real media request fails (e.g. a stale d02 delivery node).
         candidates = list(dict.fromkeys(candidates))
 
         last_error: Exception | None = None
@@ -1351,9 +1424,7 @@ def download_episode(
                 break
             except Exception as candidate_error:
                 last_error = candidate_error
-                logger.debug(
-                    f"  Media attempt {attempt} failed: {candidate_error}"
-                )
+                logger.debug(f"  Media attempt {attempt} failed: {candidate_error}")
 
         if last_error is not None:
             raise last_error
@@ -1394,6 +1465,7 @@ def download_series(
     db: LibraryDB,
     progress: Progress,
     error_log: ErrorLog,
+    workers: int = 3,
 ) -> None:
     series_name = parse_series_name(url)
     print(f"  Series name: {series_name}")
@@ -1404,34 +1476,40 @@ def download_series(
         print("  No episodes found.")
         return
 
-    print(f"  Found {len(episodes)} episode(s). Starting download...\n")
-    ok = skip = fail = 0
+    total = len(episodes)
+    print(f"  Found {total} episode(s). Starting download ({workers} parallel)...\n")
+    print_lock = threading.Lock()
+    counters = {"ok": 0, "skip": 0, "fail": 0}
 
-    for i, (ep_url, label) in enumerate(episodes, 1):
-        print(f"  [{i:>3}/{len(episodes)}] {label}")
+    def _do(item: tuple[int, tuple[str, str]]) -> None:
+        i, (ep_url, label) = item
+        with print_lock:
+            print(f"  [{i:>3}/{total}] {label}")
         success, msg, detail = download_episode(
-            ep_url,
-            network,
-            scraper,
-            config,
-            db,
-            progress,
+            ep_url, network, scraper, config, db, progress,
             series_name=series_name,
         )
-        print(f"         {msg}")
-        if success:
-            if "Skipped" in msg:
-                skip += 1
+        with print_lock:
+            print(f"         {msg}")
+            if success:
+                if "Skipped" in msg:
+                    counters["skip"] += 1
+                else:
+                    counters["ok"] += 1
             else:
-                ok += 1
-        else:
-            if "premium" in msg.lower() or "Skipped" in msg:
-                skip += 1
-            else:
-                fail += 1
-                error_log.add(label, ep_url, detail)
+                if "premium" in msg.lower() or "Skipped" in msg:
+                    counters["skip"] += 1
+                else:
+                    counters["fail"] += 1
+                    error_log.add(label, ep_url, detail)
 
-    print(f"\n  Done — {ok} downloaded, {skip} skipped, {fail} failed.")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_do, enumerate(episodes, 1)))
+
+    print(
+        f"\n  Done — {counters['ok']} downloaded, "
+        f"{counters['skip']} skipped, {counters['fail']} failed."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1471,11 +1549,13 @@ def main(
         "--list-file",
         help="Series list file (one URL per line)",
     ),
+    workers: int = typer.Option(
+        6, "--workers", "-w", help="Number of parallel episode downloads (default: 6)",
+    ),
 ):
     """
     wco-dl — download anime & cartoons from wco.tv
 
-    \b
     Examples:
       python main.py -s "slime"
       python main.py -de "https://www.wco.tv/some-episode-english-subbed"
@@ -1485,6 +1565,10 @@ def main(
     modes = [search, episode, series, all_series]
     if sum(modes) != 1:
         typer.echo("Specify exactly one mode: -s / -de / -ds / -da")
+        raise typer.Exit(1)
+
+    if workers < 1:
+        typer.echo("--workers must be at least 1")
         raise typer.Exit(1)
 
     config, network, scraper, db, progress = _init()
@@ -1544,6 +1628,7 @@ def main(
                 db,
                 progress,
                 error_log,
+                workers=workers,
             )
 
         elif all_series:
@@ -1577,6 +1662,7 @@ def main(
                         db,
                         progress,
                         error_log,
+                        workers=workers,
                     )
                 except Exception as e:
                     print(f"  ✗ Series failed: {e}")
